@@ -8,4 +8,5 @@ Run
 
     $ rebar3 shell
 
-    1> cliserv:apply(erlang, system_time, []).
+    1> cliserv:call(erlang, system_time, []).
+    2> cliserv:cast(io, fwrite, ["hello~n"]).
