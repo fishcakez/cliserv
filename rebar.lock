@@ -1,0 +1,8 @@
+{"1.1.0",
+[{<<"acceptor_pool">>,{pkg,<<"acceptor_pool">>,<<"1.0.0-rc.0">>},0},
+ {<<"sbroker">>,{pkg,<<"sbroker">>,<<"1.0.0">>},0}]}.
+[
+{pkg_hash,[
+ {<<"acceptor_pool">>, <<"679D741DF87FC13599B1AEF2DF8F78F1F880449A6BEFAB7C44FB6FAE0E92A2DE">>},
+ {<<"sbroker">>, <<"28FF1B5E58887C5098539F236307B36FE1D3EDAA2ACFF9D6A3D17C2DCAFEBBD0">>}]}
+].

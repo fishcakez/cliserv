@@ -1,0 +1,18 @@
+{application, cliserv,
+ [{description, "An OTP application"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, { cliserv_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    acceptor_pool,
+    sbroker
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {maintainers, []},
+  {licenses, []},
+  {links, []}
+ ]}.
