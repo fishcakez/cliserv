@@ -5,7 +5,8 @@
 
 %% cs_client api
 
--export([call/4]).
+-export([call/4,
+         cast/3]).
 
 %% public api
 
@@ -18,6 +19,7 @@
          closed/3,
          await/3,
          recv/3,
+         norecv/3,
          code_change/4,
          terminate/3]).
 
@@ -26,7 +28,7 @@
 -define(BACKOFF, 1000).
 -define(TIMEOUT, 3000).
 
--record(data, {monitor :: {reference(), pid()},
+-record(data, {monitor :: {reference(), pid() | reference()},
                sock :: gen_tcp:socket(),
                counter :: pos_integer()}).
 
@@ -37,6 +39,17 @@ call(Ref, {Sock, Id, Pid}, BinReq, Timeout) ->
     case gen_tcp:send(Sock, Packet) of
         ok              -> call_await(Ref, Pid, Id, Sock, Timeout);
         {error, Reason} -> call_error(Ref, Pid, {inet, Reason})
+    end.
+
+cast(Ref, {Sock, _, Pid}, BinReq) ->
+    Packet = cs_packet:encode(cast, undefined, BinReq),
+    case gen_tcp:send(Sock, Packet) of
+        ok ->
+            done(Pid, Ref);
+        {error, Reason} ->
+            NReason = {inet, Reason},
+            close(Pid, Ref, NReason),
+            {error, NReason}
     end.
 
 %% public api
@@ -68,6 +81,9 @@ closed(Type, Event, Data) ->
 await(info, {MRef, {go, Ref, {call, Pid}, _, _}},
       #data{monitor={MRef, _}} = Data) ->
     active_recv(Ref, Pid, Data);
+await(info, {MRef, {go, Ref, {cast, Pid}, _, _}},
+      #data{monitor={MRef, _}} = Data) ->
+    active_norecv(Ref, Pid, Data);
 await(info, {MRef, {drop, _}}, #data{monitor={MRef, _}} = Data) ->
     close(shutdown, Data);
 await(info, {tcp_error, Sock, Reason}, #data{sock=Sock} = Data) ->
@@ -77,12 +93,23 @@ await(info, {tcp_closed, Sock}, #data{sock=Sock} = Data) ->
 await(Type, Event, Data) ->
     handle_event(Type, Event, await, Data).
 
-recv(cast, {done, MRef}, #data{monitor={MRef, _}} = Data) ->
-    ask(Data);
+recv(cast, {done, MRef}, #data{monitor={MRef, _}, counter=Counter} = Data) ->
+    passive_ask(Data#data{counter=Counter+1});
 recv(cast, {close, MRef, Reason}, #data{monitor={MRef, _}} = Data) ->
     close(Reason, Data);
 recv(Type, Event, Data) ->
     handle_event(Type, Event, recv, Data).
+
+norecv(info, {tcp_error, Sock, Reason}, #data{sock=Sock} = Data) ->
+    close({inet, Reason}, Data);
+norecv(info, {tcp_closed, Sock}, #data{sock=Sock} = Data) ->
+    close({inet, closed}, Data);
+norecv(cast, {done, Ref}, #data{monitor={_, Ref}} = Data) ->
+    active_ask(Data);
+norecv(cast, {close, Ref, Reason}, #data{monitor={_, Ref}} = Data) ->
+    close(Reason, Data);
+norecv(Type, Event, Data) ->
+    handle_event(Type, Event, norecv, Data).
 
 code_change(_, State, Data, _) ->
     {ok, State, Data}.
@@ -118,14 +145,19 @@ backoff() ->
     Backoff = ?BACKOFF div 2 + rand:uniform(?BACKOFF),
     {keep_state, erlang:start_timer(Backoff, self(), connect)}.
 
-ask(#data{monitor={MRef, _}, sock=Sock, counter=Counter} = Data) ->
+passive_ask(#data{monitor={MRef, _}, sock=Sock, counter=Counter} = Data) ->
     demonitor(MRef, [flush]),
-    NCounter = Counter+1,
-    NData = Data#data{counter=NCounter},
-    case cs_client:dynamic_ask_r(?MODULE, {Sock, NCounter, self()}) of
-        {go, Ref, {call, Pid}, _, _} -> passive_recv(Ref, Pid, NData);
-        {await, NMRef, Pid}          -> activate(NMRef, Pid, NData)
+    case cs_client:dynamic_ask_r(?MODULE, {Sock, Counter, self()}) of
+        {go, Ref, {call, Pid}, _, _} -> passive_recv(Ref, Pid, Data);
+        {go, Ref, {cast, Pid}, _, _} -> passive_norecv(Ref, Pid, Data);
+        {await, NMRef, Pid}          -> activate(NMRef, Pid, Data)
     end.
+
+active_ask(#data{monitor={MRef, _}, sock=Sock, counter=Counter} = Data) ->
+    demonitor(MRef, [flush]),
+    Info = {Sock, Counter, self()},
+    {await, NMRef, Pid} = cs_client:async_ask_r(?MODULE, Info),
+    {next_state, await, Data#data{monitor={NMRef, Pid}}}.
 
 passive_recv(Ref, Pid, #data{monitor={MRef, _}} = Data) ->
     NMRef = client_recv(Pid, Ref),
@@ -168,8 +200,20 @@ flush(Result, #data{sock=Sock}) ->
         0                          -> Result
     end.
 
-next_fun(recv)            -> fun ask/1;
+next_fun(recv)            -> fun passive_ask/1;
 next_fun({error, Reason}) -> fun(Data) -> close(Reason, Data) end.
+
+passive_norecv(Ref, Pid, #data{sock=Sock} = Data) ->
+    case inet:setopts(Sock, [{active, once}]) of
+        ok              -> active_norecv(Ref, Pid, Data);
+        {error, einval} -> cancel({inet, closed}, Data);
+        {error, Reason} -> cancel({inet, Reason}, Data)
+    end.
+
+active_norecv(Ref, Pid, #data{monitor={MRef, _}} = Data) ->
+    demonitor(MRef, [flush]),
+    NMRef = monitor(process, Pid),
+    {next_state, norecv, Data#data{monitor={NMRef, Ref}}}.
 
 activate(MRef, Pid, #data{sock=Sock} = Data) ->
     NData = Data#data{monitor={MRef, Pid}},
@@ -189,6 +233,8 @@ cancel_await(Reason, #data{monitor={MRef, _}} = Data) ->
     case sbroker:await(MRef, 0) of
         {go, Ref, {call, Pid}, _, _} ->
             client_error(Pid, Ref, Reason),
+            close(Reason, Data);
+        {go, _, {cast, _}, _, _} ->
             close(Reason, Data);
         {drop, _} ->
             close(Reason, Data)

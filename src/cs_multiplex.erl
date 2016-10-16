@@ -5,7 +5,8 @@
 
 %% cs_client api
 
--export([call/4]).
+-export([call/4,
+         cast/3]).
 
 %% public api
 
@@ -33,7 +34,8 @@
 -record(data, {broker = undefined :: undefined | {reference(), pid()},
                sender = undefined :: undefined | reference(),
                clients = #{} ::
-                #{pos_integer() => {reference(), pid(), reference()} | ignore},
+                #{pos_integer() =>
+                  {reference(), pid() | undefined, reference()} | ignore},
                sock :: gen_tcp:socket(),
                counter :: pos_integer(),
                ignores = 0 :: non_neg_integer()}).
@@ -51,6 +53,17 @@ call(Ref, {Sock, Id, Pid}, BinReq, Timeout) ->
             MRef = monitor(process, Pid),
             gen_statem:cast(Pid, {close, Ref, {inet, Reason}}),
             call_await(Ref, Pid, MRef, infinity)
+    end.
+
+cast(Ref, {Sock, Id, Pid}, BinReq) ->
+    Packet = cs_packet:encode(cast, undefined, BinReq),
+    case gen_tcp:send(Sock, Packet) of
+        ok ->
+            gen_statem:cast(Pid, {done, Ref, Id});
+        {error, Reason} ->
+            NReason = {inet, Reason},
+            gen_statem:cast(Pid, {close, Ref, NReason}),
+            {error, NReason}
     end.
 
 %% public api
@@ -81,7 +94,10 @@ closed(Type, Event, Data) ->
 
 await(info, {MRef, {go, Ref, {call, Pid}, _, _}},
       #data{broker={MRef, _}} = Data) ->
-    go(Ref, Pid, Data);
+    go_call(Ref, Pid, Data);
+await(info, {MRef, {go, Ref, {cast, Pid}, _, _}},
+      #data{broker={MRef, _}} = Data) ->
+    go_cast(Ref, Pid, Data);
 await(info, {MRef, {drop, _}}, #data{broker={MRef, _}} = Data) ->
     demonitor(MRef, [flush]),
     shutdown(Data#data{broker=undefined});
@@ -107,6 +123,8 @@ send(cast, {sent, Ref}, #data{sender=Ref} = Data) when is_reference(Ref) ->
 send(cast, {close, Ref, Reason}, #data{sender=Ref} = Data)
   when is_reference(Ref) ->
     close(Reason, Data);
+send(cast, {done, Ref, Id}, #data{sender=Ref} = Data) when is_reference(Ref) ->
+    done(Id, Data);
 send(Type, Event, Data) ->
     handle_event(Type, Event, send, Data).
 
@@ -182,13 +200,21 @@ backoff() ->
     Backoff = ?BACKOFF div 2 + rand:uniform(?BACKOFF),
     {keep_state, erlang:start_timer(Backoff, self(), connect)}.
 
-go(Ref, Pid,
+go_call(Ref, Pid,
    #data{broker={BrokerMRef, _}, clients=Clients, counter=Counter} = Data) ->
     demonitor(BrokerMRef, [flush]),
     ClientMRef = monitor(process, Pid),
     NClients = Clients#{Counter => {Ref, Pid, ClientMRef}},
     NData = Data#data{broker=undefined, clients=NClients, counter=Counter+1,
                       sender=Ref},
+    {next_state, send, NData}.
+
+go_cast(Ref, Pid, #data{broker={BrokerMRef, _}, clients=Clients,
+                        counter=Counter} = Data) ->
+    demonitor(BrokerMRef, [flush]),
+    ClientMRef = monitor(process, Pid),
+    NClients = Clients#{Counter => {Ref, undefined, ClientMRef}},
+    NData = Data#data{broker=undefined, clients=NClients, sender=Ref},
     {next_state, send, NData}.
 
 await_decode(Bin, Data) ->
@@ -221,11 +247,11 @@ shutdown_decode(Bin, Data) ->
 decode(Bin, #data{clients=Clients, ignores=Ignores, sender=Sender} = Data) ->
     {reply, Id, BinResp} = cs_packet:decode(Bin),
     case maps:take(Id, Clients) of
-        {{Sender, Pid, MRef}, NClients} ->
+        {{Sender, Pid, MRef}, NClients} when is_pid(Pid) ->
             client_reply(Pid, Sender, BinResp),
             demonitor(MRef, [flush]),
             Data#data{clients=NClients, sender=undefined};
-        {{Ref, Pid, MRef}, NClients} ->
+        {{Ref, Pid, MRef}, NClients} when is_pid(Pid) ->
             client_reply(Pid, Ref, BinResp),
             demonitor(MRef, [flush]),
             Data#data{clients=NClients};
@@ -240,6 +266,12 @@ send_sent(#data{clients=Clients, sock=Sock, counter=Counter} = Data)
 send_sent(Data) ->
     {next_state, recv, Data#data{sender=undefined}}.
 
+done(Id, #data{clients=Clients, sock=Sock, counter=Counter} = Data) ->
+    {{_, _, MRef}, NClients} = maps:take(Id, Clients),
+    demonitor(MRef, [flush]),
+    {await, NMRef, Pid} = async_ask_r(Sock, Counter),
+    {next_state, await, Data#data{broker={NMRef, Pid}, clients=NClients}}.
+
 shutdown_sent(#data{sock=Sock} = Data) ->
     NData = Data#data{sender=undefined},
     case gen_tcp:shutdown(Sock, write) of
@@ -249,6 +281,10 @@ shutdown_sent(#data{sock=Sock} = Data) ->
 
 down(MRef, State, #data{sender=Ref, clients=Clients, ignores=Ignores} = Data) ->
     case find(MRef, 3, Data) of
+        {Id, {Ref, undefined, _}} ->
+            NData = Data#data{clients=maps:remove(Id, Clients),
+                              sender=undefined},
+            shutdown(NData);
         {Id, {Ref, _, _}} ->
             NData = Data#data{clients=Clients#{Id := ignore}, ignores=Ignores+1,
                               sender=undefined},
@@ -259,7 +295,7 @@ down(MRef, State, #data{sender=Ref, clients=Clients, ignores=Ignores} = Data) ->
 
 timeout(Ref, State, Data) ->
     case find(Ref, 1, Data) of
-        {Id, {Ref, Pid, MRef}} ->
+        {Id, {Ref, Pid, MRef}} when is_pid(Pid) ->
             Reason = {inet, timeout},
             client_error(Pid, Ref, Reason),
             demonitor(MRef, [flush]),

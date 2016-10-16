@@ -4,6 +4,7 @@
 
 -export([call/1,
          call/2,
+         cast/1,
          dynamic_ask_r/2,
          async_ask_r/2,
          cancel/2,
@@ -29,6 +30,12 @@
       Reason :: reason(),
       ExitReason :: term().
 
+-callback cast(Ref, Info, BinReq) -> ok | {error, Reason} when
+      Ref :: reference(),
+      Info :: term(),
+      BinReq :: binary(),
+      Reason :: reason().
+
 %% public api
 
 call(Req) ->
@@ -41,6 +48,10 @@ call(Req, Timeout) ->
         {error, _} = Error -> Error;
         {exit, Reason}     -> exit({Reason, {?MODULE, call, [Req, Timeout]}})
     end.
+
+cast(Req) ->
+    BinReq = term_to_binary(Req),
+    cast_ask(BinReq).
 
 dynamic_ask_r(Mod, Info) ->
     sbroker:dynamic_ask_r(?MODULE, {Mod, Info}).
@@ -71,6 +82,14 @@ call_ask(BinReq, Timeout) ->
     case sbroker:ask(?MODULE, {call, self()}) of
         {go, Ref, {Mod, Info}, _, _} ->
             Mod:call(Ref, Info, BinReq, Timeout);
+        {drop, _} = Drop ->
+            {error, Drop}
+    end.
+
+cast_ask(BinReq) ->
+    case sbroker:ask(?MODULE, {cast, self()}) of
+        {go, Ref, {Mod, Info}, _, _} ->
+            Mod:cast(Ref, Info, BinReq);
         {drop, _} = Drop ->
             {error, Drop}
     end.
