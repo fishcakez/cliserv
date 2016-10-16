@@ -8,4 +8,4 @@ Run
 
     $ rebar3 shell
 
-    1> cliserver:apply(erlang, system_time, []).
+    1> cliserv:apply(erlang, system_time, []).
