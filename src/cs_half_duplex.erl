@@ -121,7 +121,11 @@ terminate(_, _, _) ->
 
 handle_event(info, {'DOWN', MRef, _, _, _}, _,
              #data{monitor={MRef, _}} = Data) ->
-    close(shutdown, Data).
+    close(shutdown, Data);
+handle_event(cast, {done, _}, _, _) ->
+    keep_state_and_data;
+handle_event(cast, {close, _, _}, _, _) ->
+    keep_state_and_data.
 
 connect(Addr, Port) ->
     Opts = [{packet, 4}, {active, once}, {mode, binary}, {send_timeout, 5000},

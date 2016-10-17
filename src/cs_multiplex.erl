@@ -169,7 +169,9 @@ handle_event(info, {'DOWN', MRef, _, _, _}, State, Data) ->
     down(MRef, State, Data);
 handle_event(cast, {close, _, _}, _, _) ->
     keep_state_and_data;
-handle_event(cast, {sent, _, _}, _, _) ->
+handle_event(cast, {sent, _}, _, _) ->
+    keep_state_and_data;
+handle_event(cast, {done, _, _}, _, _) ->
     keep_state_and_data;
 handle_event(cast, {timeout, Ref}, State, #data{sender=Sender} = Data)
   when Sender =/= Ref ->
