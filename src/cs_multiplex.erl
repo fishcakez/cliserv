@@ -124,7 +124,7 @@ send(cast, {close, Ref, Reason}, #data{sender=Ref} = Data)
   when is_reference(Ref) ->
     close(Reason, Data);
 send(cast, {done, Ref, Id}, #data{sender=Ref} = Data) when is_reference(Ref) ->
-    done(Id, Data);
+    send_done(Id, Data);
 send(Type, Event, Data) ->
     handle_event(Type, Event, send, Data).
 
@@ -148,6 +148,8 @@ shutdown(cast, {sent, Ref}, #data{sender=Ref} = Data) when is_reference(Ref) ->
 shutdown(cast, {close, Ref, Reason}, #data{sender=Ref} = Data)
   when is_reference(Ref) ->
     close(Reason, Data);
+shutdown(cast, {done, Ref, Id}, #data{sender=Ref} = Data) when is_reference(Ref) ->
+    shutdown_done(Id, Data);
 shutdown(Type, Event, Data) ->
     handle_event(Type, Event, shutdown, Data).
 
@@ -268,14 +270,23 @@ send_sent(#data{clients=Clients, sock=Sock, counter=Counter} = Data)
 send_sent(Data) ->
     {next_state, recv, Data#data{sender=undefined}}.
 
-done(Id, #data{clients=Clients, sock=Sock, counter=Counter} = Data) ->
+shutdown_sent(#data{sock=Sock} = Data) ->
+    NData = Data#data{sender=undefined},
+    case gen_tcp:shutdown(Sock, write) of
+        ok               -> {keep_state, NData};
+        {error, NReason} -> close({inet, NReason}, NData)
+    end.
+
+send_done(Id, #data{clients=Clients, sock=Sock, counter=Counter} = Data) ->
     {{_, _, MRef}, NClients} = maps:take(Id, Clients),
     demonitor(MRef, [flush]),
     {await, NMRef, Pid} = async_ask_r(Sock, Counter),
     {next_state, await, Data#data{broker={NMRef, Pid}, clients=NClients}}.
 
-shutdown_sent(#data{sock=Sock} = Data) ->
-    NData = Data#data{sender=undefined},
+shutdown_done(Id, #data{clients=Clients, sock=Sock} = Data) ->
+    {{_, _, MRef}, NClients} = maps:take(Id, Clients),
+    demonitor(MRef, [flush]),
+    NData = Data#data{sender=undefined, clients=NClients},
     case gen_tcp:shutdown(Sock, write) of
         ok               -> {keep_state, NData};
         {error, NReason} -> close({inet, NReason}, NData)
@@ -340,20 +351,15 @@ ignore_cancel(#data{broker={MRef, Pid}} = Data) ->
 ignore_await(#data{broker={MRef, _}} = Data) ->
     case sbroker:await(MRef, 0) of
         {go, Ref, {call, Pid}, _, _} ->
-            ignore_go(Ref, Pid, Data);
+            {next_state, send, NData} = go_call(Ref, Pid, Data),
+            {next_state, shutdown, NData};
+        {go, Ref, {cast, Pid}, _, _} ->
+            {next_state, send, NData} = go_cast(Ref, Pid, Data),
+            {next_state, shutdown, NData};
         {drop, _} ->
             demonitor(MRef, [flush]),
             close(shutdown, Data#data{broker=undefined})
     end.
-
-ignore_go(Ref, Pid, #data{broker={BrokerMRef, _}, clients=Clients,
-                          counter=Counter} = Data) ->
-    demonitor(BrokerMRef, [flush]),
-    ClientMRef = monitor(process, Pid),
-    NClients = Clients#{Counter => {Ref, Pid, ClientMRef}},
-    NData = Data#data{broker=undefined, clients=NClients, counter=Counter+1,
-                      sender=Ref},
-    {next_state, shutdown, NData}.
 
 cancel(Reason, #data{broker={MRef, Pid}} = Data) ->
     case cs_client:cancel(Pid, MRef) of
