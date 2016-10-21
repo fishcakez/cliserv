@@ -6,8 +6,9 @@
   {applications,
    [kernel,
     stdlib,
-    acceptor_pool,
-    sbroker
+    sbroker,
+    fuse,
+    acceptor_pool
    ]},
   {env,[]},
   {modules, []},

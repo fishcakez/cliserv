@@ -21,6 +21,8 @@
          send/3,
          recv/3,
          shutdown/3,
+         blown_shutdown/3,
+         blown/3,
          code_change/4,
          terminate/3]).
 
@@ -74,7 +76,10 @@ start_link() ->
 %% gen_statem api
 
 init([]) ->
-    {ok, closed, undefined, {next_event, internal, connect}}.
+    case cs_client_fuse:ask() of
+        ok    -> {ok, closed, undefined, {next_event, internal, connect}};
+        blown -> {ok, blown, undefined}
+    end.
 
 callback_mode() ->
     state_functions.
@@ -89,6 +94,9 @@ closed(internal, connect, undefined) ->
     end;
 closed(info, {timeout, TRef, connect}, TRef) ->
     {keep_state, undefined, {next_event, internal, connect}};
+closed(info, {cs_client_fuse, blown}, TRef) ->
+    cancel_backoff(TRef),
+    {next_state, blown, undefined};
 closed(Type, Event, Data) ->
     handle_event(Type, Event, closed, Data).
 
@@ -100,15 +108,17 @@ await(info, {MRef, {go, Ref, {cast, Pid}, _, _}},
     go_cast(Ref, Pid, Data);
 await(info, {MRef, {drop, _}}, #data{broker={MRef, _}} = Data) ->
     demonitor(MRef, [flush]),
-    shutdown(Data#data{broker=undefined});
+    shutdown(await, Data#data{broker=undefined});
 await(info, {'DOWN', MRef, _, _, _}, #data{broker={MRef, _}} = Data) ->
-    shutdown(Data#data{broker=undefined});
+    shutdown(await, Data#data{broker=undefined});
 await(info, {tcp, Sock, Bin}, #data{sock=Sock} = Data) ->
     await_decode(Bin, Data);
 await(info, {tcp_error, Sock, Reason}, #data{sock=Sock} = Data) ->
     cancel({inet, Reason}, Data);
 await(info, {tcp_closed, Sock}, #data{sock=Sock} = Data) ->
     cancel({inet, closed}, Data);
+await(info, {cs_client_fuse, blown}, Data) ->
+    blown_cancel(Data);
 await(Type, Event, Data) ->
     handle_event(Type, Event, await, Data).
 
@@ -125,6 +135,8 @@ send(cast, {close, Ref, Reason}, #data{sender=Ref} = Data)
     close(Reason, Data);
 send(cast, {done, Ref, Id}, #data{sender=Ref} = Data) when is_reference(Ref) ->
     send_done(Id, Data);
+send(info, {cs_client_fuse, blown}, Data) ->
+    {next_state, blown_shutdown, Data};
 send(Type, Event, Data) ->
     handle_event(Type, Event, send, Data).
 
@@ -134,24 +146,58 @@ recv(info, {tcp_error, Sock, Reason}, #data{sock=Sock} = Data) ->
     close({inet, Reason}, Data);
 recv(info, {tcp_closed, Sock}, #data{sock=Sock} = Data) ->
     close({inet, closed}, Data);
+recv(info, {cs_client_fuse, blown}, Data) ->
+    blown_shutdown(Data);
 recv(Type, Event, Data) ->
     handle_event(Type, Event, recv, Data).
 
 shutdown(info, {tcp, Sock, Bin}, #data{sock=Sock} = Data) ->
-    shutdown_decode(Bin, Data);
+    shutdown_decode(Bin, shutdown, Data);
 shutdown(info, {tcp_error, Sock, Reason}, #data{sock=Sock} = Data) ->
     close({inet, Reason}, Data);
 shutdown(info, {tcp_closed, Sock}, #data{sock=Sock} = Data) ->
     close({inet, closed}, Data);
 shutdown(cast, {sent, Ref}, #data{sender=Ref} = Data) when is_reference(Ref) ->
-    shutdown_sent(Data);
+    shutdown_sent(shutdown, Data);
 shutdown(cast, {close, Ref, Reason}, #data{sender=Ref} = Data)
   when is_reference(Ref) ->
     close(Reason, Data);
-shutdown(cast, {done, Ref, Id}, #data{sender=Ref} = Data) when is_reference(Ref) ->
-    shutdown_done(Id, Data);
+shutdown(cast, {done, Ref, Id}, #data{sender=Ref} = Data)
+  when is_reference(Ref) ->
+    shutdown_done(Id, shutdown, Data);
+shutdown(info, {cs_client_fuse, blown}, Data) ->
+    {next_state, blown_shutdown, Data};
 shutdown(Type, Event, Data) ->
     handle_event(Type, Event, shutdown, Data).
+
+blown_shutdown(info, {tcp, Sock, Bin}, #data{sock=Sock} = Data) ->
+    shutdown_decode(Bin, blown_shutdown, Data);
+blown_shutdown(info, {tcp_error, Sock, Reason}, #data{sock=Sock} = Data) ->
+    blown_close({inet, Reason}, Data);
+blown_shutdown(info, {tcp_closed, Sock}, #data{sock=Sock} = Data) ->
+    blown_close({inet, closed}, Data);
+blown_shutdown(cast, {sent, Ref}, #data{sender=Ref} = Data)
+  when is_reference(Ref) ->
+    shutdown_sent(blown_shutdown, Data);
+blown_shutdown(cast, {close, Ref, Reason}, #data{sender=Ref} = Data)
+  when is_reference(Ref) ->
+    blown_close(Reason, Data);
+blown_shutdown(cast, {done, Ref, Id}, #data{sender=Ref} = Data)
+  when is_reference(Ref) ->
+    shutdown_done(Id, blown_shutdown, Data);
+blown_shutdown(info, {cs_client_fuse, ok}, Data) ->
+    {next_state, shutdown, Data};
+blown_shutdown(info, {cs_client_fuse, blown}, _) ->
+    keep_state_and_data;
+blown_shutdown(Type, Event, Data) ->
+    handle_event(Type, Event, blown_shutdown, Data).
+
+blown(info, {cs_client_fuse, ok}, undefined) ->
+    {next_state, closed, undefined, {next_event, internal, connect}};
+blown(info, {cs_client_fuse, blown}, undefined) ->
+    keep_state_and_data;
+blown(Type, Event, Data) ->
+    handle_event(Type, Event, blown, Data).
 
 code_change(_, State, Data, _) ->
     {ok, State, Data}.
@@ -177,7 +223,9 @@ handle_event(cast, {done, _, _}, _, _) ->
     keep_state_and_data;
 handle_event(cast, {timeout, Ref}, State, #data{sender=Sender} = Data)
   when Sender =/= Ref ->
-    timeout(Ref, State, Data).
+    timeout(Ref, State, Data);
+handle_event(info, {cs_client_fuse, ok}, _, _) ->
+    keep_state_and_data.
 
 connect(Addr, Port) ->
     Opts = [{packet, 4}, {active, ?ACTIVE}, {mode, binary},
@@ -198,11 +246,25 @@ async_ask_r(Sock, Id) ->
 backoff(Reason) ->
     error_logger:error_msg("cliserv ~p ~p backing off: ~ts~n",
                            [?MODULE, self(), cs_client:format_error(Reason)]),
+    melt(Reason),
     backoff().
 
 backoff() ->
     Backoff = ?BACKOFF div 2 + rand:uniform(?BACKOFF),
     {keep_state, erlang:start_timer(Backoff, self(), connect)}.
+
+cancel_backoff(TRef) ->
+    case erlang:cancel_timer(TRef) of
+        false -> flush_backoff(TRef);
+        _     -> ok
+    end.
+
+flush_backoff(TRef) ->
+    receive
+        {timeout, TRef, _} -> ok
+    after
+        0 -> error(badtimer, [TRef])
+    end.
 
 go_call(Ref, Pid,
    #data{broker={BrokerMRef, _}, clients=Clients, counter=Counter} = Data) ->
@@ -239,11 +301,11 @@ recv_decode(Bin, #data{clients=Clients} = Data)
     {await, MRef, Pid} = async_ask_r(Sock, Counter),
     {next_state, await, NData#data{broker={MRef, Pid}}}.
 
-shutdown_decode(Bin, Data) ->
+shutdown_decode(Bin, State, Data) ->
     case decode(Bin, Data) of
         #data{clients=Clients, ignores=Ignores} = NData
           when map_size(Clients) == Ignores ->
-            close(shutdown, NData);
+            close(shutdown, State, NData);
         NData ->
             {keep_state, NData}
     end.
@@ -270,11 +332,11 @@ send_sent(#data{clients=Clients, sock=Sock, counter=Counter} = Data)
 send_sent(Data) ->
     {next_state, recv, Data#data{sender=undefined}}.
 
-shutdown_sent(#data{sock=Sock} = Data) ->
+shutdown_sent(State, #data{sock=Sock} = Data) ->
     NData = Data#data{sender=undefined},
     case gen_tcp:shutdown(Sock, write) of
         ok               -> {keep_state, NData};
-        {error, NReason} -> close({inet, NReason}, NData)
+        {error, NReason} -> close({inet, NReason}, State, NData)
     end.
 
 send_done(Id, #data{clients=Clients, sock=Sock, counter=Counter} = Data) ->
@@ -283,13 +345,13 @@ send_done(Id, #data{clients=Clients, sock=Sock, counter=Counter} = Data) ->
     {await, NMRef, Pid} = async_ask_r(Sock, Counter),
     {next_state, await, Data#data{broker={NMRef, Pid}, clients=NClients}}.
 
-shutdown_done(Id, #data{clients=Clients, sock=Sock} = Data) ->
+shutdown_done(Id, State, #data{clients=Clients, sock=Sock} = Data) ->
     {{_, _, MRef}, NClients} = maps:take(Id, Clients),
     demonitor(MRef, [flush]),
     NData = Data#data{sender=undefined, clients=NClients},
     case gen_tcp:shutdown(Sock, write) of
         ok               -> {keep_state, NData};
-        {error, NReason} -> close({inet, NReason}, NData)
+        {error, NReason} -> close({inet, NReason}, State, NData)
     end.
 
 down(MRef, State, #data{sender=Ref, clients=Clients, ignores=Ignores} = Data) ->
@@ -297,11 +359,11 @@ down(MRef, State, #data{sender=Ref, clients=Clients, ignores=Ignores} = Data) ->
         {Id, {Ref, undefined, _}} ->
             NData = Data#data{clients=maps:remove(Id, Clients),
                               sender=undefined},
-            shutdown(NData);
+            shutdown(State, NData);
         {Id, {Ref, _, _}} ->
             NData = Data#data{clients=Clients#{Id := ignore}, ignores=Ignores+1,
                               sender=undefined},
-            shutdown(NData);
+            shutdown(State, NData);
         {Id, _} ->
             ignore(Id, State, Data)
     end.
@@ -334,7 +396,7 @@ ignore(Id, State, #data{clients=Clients, ignores=Ignores} = Data) ->
         map_size(NClients) == NIgnores, State == await ->
             ignore_cancel(NData);
         map_size(NClients) == NIgnores ->
-            close(shutdown, NData);
+            close(shutdown, State, NData);
         true ->
             {keep_state, NData}
     end.
@@ -382,6 +444,11 @@ cancel_await(Reason, #data{broker={MRef, _}} = Data) ->
             close(Reason, NData)
     end.
 
+close(Reason, blown_shutdown, Data) ->
+    blown_close(Reason, Data);
+close(Reason, _, Data) ->
+    close(Reason, Data).
+
 close(Reason, #data{clients=Clients, broker=undefined, sock=Sock} = Data) ->
     report_close(Reason),
     _ = [client_error(Pid, Ref, Reason) ||
@@ -389,6 +456,7 @@ close(Reason, #data{clients=Clients, broker=undefined, sock=Sock} = Data) ->
          demonitor(MRef, [flush])],
     gen_tcp:close(Sock),
     flush(Data),
+    melt(Reason),
     {next_state, closed, undefined, {next_event, internal, connect}}.
 
 report_close(shutdown) ->
@@ -396,6 +464,11 @@ report_close(shutdown) ->
 report_close(Reason) ->
     error_logger:error_msg("~p ~p closing socket: ~ts~n",
                            [?MODULE, self(), cs_client:format_error(Reason)]).
+
+melt(shutdown) ->
+    ok;
+melt(Reason) ->
+    cs_client_fuse:melt(Reason).
 
 flush(#data{sock=Sock} = Data) ->
     receive
@@ -407,14 +480,53 @@ flush(#data{sock=Sock} = Data) ->
         0                       -> ok
     end.
 
-shutdown(#data{clients=Clients, ignores=Ignores} = Data)
+shutdown(State, #data{clients=Clients, ignores=Ignores} = Data)
   when map_size(Clients) == Ignores ->
-    close(shutdown, Data);
-shutdown(#data{sock=Sock} = Data) ->
+    close(shutdown, State, Data);
+shutdown(State, #data{sock=Sock} = Data) ->
     case gen_tcp:shutdown(Sock, write) of
-        ok              -> {next_state, shutdown, Data};
-        {error, Reason} -> close({inet, Reason}, Data)
+        ok when State == shutdown; State == blown_shutdown ->
+            {keep_state, Data};
+        ok when State == await; State == send; State == recv ->
+            {next_state, shutdown, Data};
+        {error, Reason} ->
+            close({inet, Reason}, State, Data)
     end.
+
+blown_cancel(#data{broker={MRef, Pid}} = Data) ->
+    case cs_client:cancel(Pid, MRef) of
+        1 ->
+            demonitor(MRef, [flush]),
+            blown_shutdown(Data#data{broker=undefined});
+        false ->
+            blown_await(Data)
+    end.
+
+blown_await(#data{broker={MRef, _}} = Data) ->
+    case sbroker:await(MRef, 0) of
+        {go, Ref, {call, Pid}, _, _} ->
+            {next_state, send, NData} = go_call(Ref, Pid, Data),
+            {next_state, blown_shutdown, NData};
+        {go, Ref, {cast, Pid}, _, _} ->
+            {next_state, send, NData} = go_cast(Ref, Pid, Data),
+            {next_state, blown_shutdown, NData};
+        {drop, _} ->
+            demonitor(MRef, [flush]),
+            blown_shutdown(Data#data{broker=undefined})
+    end.
+
+blown_shutdown(#data{clients=Clients, ignores=Ignores} = Data)
+  when map_size(Clients) == Ignores ->
+    blown_close(shutdown, Data);
+blown_shutdown(#data{sock=Sock} = Data) ->
+    case gen_tcp:shutdown(Sock, write) of
+        ok              -> {next_state, blown_shutdown, Data};
+        {error, Reason} -> blown_close({inet, Reason}, Data)
+    end.
+
+blown_close(Reason, Data) ->
+    _ = close(Reason, Data),
+    {next_state, blown, undefined}.
 
 call_await(Ref, Pid, MRef, Timeout) ->
     receive

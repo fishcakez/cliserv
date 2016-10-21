@@ -18,19 +18,17 @@ start_link() ->
 %% supervisor api
 
 init([]) ->
-    Half = [half_duplex(Id) || Id <- lists:seq(1, 4)],
-    Multi = multiplex(1),
-    {ok, {#{strategy => one_for_one, intensity => 3, period => 300},
-          [Multi | Half]}}.
+    {ok, {#{strategy => rest_for_one, intensity => 1, period => 300},
+          [pool(), fuse()]}}.
 
 %% internal
 
-half_duplex(Id) ->
-    #{id => {cs_half_duplex, Id},
-      start => {cs_half_duplex, start_link, []},
-      type => worker}.
+pool() ->
+    #{id => cs_client_pool,
+      start => {cs_client_pool, start_link, []},
+      type => supervisor}.
 
-multiplex(Id) ->
-    #{id => {cs_multiplex, Id},
-      start => {cs_multiplex, start_link, []},
+fuse() ->
+    #{id => {cs_client_watcher, cs_client_fuse},
+      start => {cs_client_watcher, start_link, [fuse_event, cs_client_fuse]},
       type => worker}.

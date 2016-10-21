@@ -19,7 +19,10 @@
          closed/3,
          await/3,
          recv/3,
+         blown_recv/3,
          norecv/3,
+         blown_norecv/3,
+         blown/3,
          code_change/4,
          terminate/3]).
 
@@ -60,7 +63,10 @@ start_link() ->
 %% gen_statem api
 
 init([]) ->
-    {ok, closed, undefined, {next_event, internal, connect}}.
+    case cs_client_fuse:ask() of
+        ok    -> {ok, closed, undefined, {next_event, internal, connect}};
+        blown -> {ok, blown, undefined}
+    end.
 
 callback_mode() ->
     state_functions.
@@ -75,6 +81,9 @@ closed(internal, connect, undefined) ->
     end;
 closed(info, {timeout, TRef, connect}, TRef) ->
     {keep_state, undefined, {next_event, internal, connect}};
+closed(info, {cs_client_fuse, blown}, TRef) ->
+    cancel_backoff(TRef),
+    {next_state, blown, undefined};
 closed(Type, Event, Data) ->
     handle_event(Type, Event, closed, Data).
 
@@ -90,6 +99,8 @@ await(info, {tcp_error, Sock, Reason}, #data{sock=Sock} = Data) ->
     cancel({inet, Reason}, Data);
 await(info, {tcp_closed, Sock}, #data{sock=Sock} = Data) ->
     cancel({inet, closed}, Data);
+await(info, {cs_client_fuse, blown}, Data) ->
+    blown_cancel(Data);
 await(Type, Event, Data) ->
     handle_event(Type, Event, await, Data).
 
@@ -97,8 +108,23 @@ recv(cast, {done, MRef}, #data{monitor={MRef, _}, counter=Counter} = Data) ->
     passive_ask(Data#data{counter=Counter+1});
 recv(cast, {close, MRef, Reason}, #data{monitor={MRef, _}} = Data) ->
     close(Reason, Data);
+recv(info, {cs_client_fuse, blown}, Data) ->
+    {next_state, blown_recv, Data};
 recv(Type, Event, Data) ->
     handle_event(Type, Event, recv, Data).
+
+blown_recv(cast, {done, MRef}, #data{monitor={MRef, _}} = Data) ->
+    blown_close(shutdown, Data);
+blown_recv(cast, {close, MRef, Reason}, #data{monitor={MRef, _}} = Data) ->
+    blown_close(Reason, Data);
+blown_recv(info, {cs_client_fuse, ok}, Data) ->
+    {next_state, recv, Data};
+blown_recv(info, {cs_client_fuse, blown}, _) ->
+    keep_state_and_data;
+blown_recv(info, {'DOWN', MRef, _, _, _}, #data{monitor={MRef, _}} = Data) ->
+    blown_close(shutdown, Data);
+blown_recv(Type, Event, Data) ->
+    handle_event(Type, Event, blown_recv, Data).
 
 norecv(info, {tcp_error, Sock, Reason}, #data{sock=Sock} = Data) ->
     close({inet, Reason}, Data);
@@ -108,8 +134,34 @@ norecv(cast, {done, Ref}, #data{monitor={_, Ref}} = Data) ->
     active_ask(Data);
 norecv(cast, {close, Ref, Reason}, #data{monitor={_, Ref}} = Data) ->
     close(Reason, Data);
+norecv(info, {cs_client_fuse, blown}, Data) ->
+    {next_state, blown_norecv, Data};
 norecv(Type, Event, Data) ->
     handle_event(Type, Event, norecv, Data).
+
+blown_norecv(info, {tcp_error, Sock, Reason}, #data{sock=Sock} = Data) ->
+    blown_close({inet, Reason}, Data);
+blown_norecv(info, {tcp_closed, Sock}, #data{sock=Sock} = Data) ->
+    blown_close({inet, closed}, Data);
+blown_norecv(cast, {done, Ref}, #data{monitor={_, Ref}} = Data) ->
+    blown_close(shutdown, Data);
+blown_norecv(cast, {close, Ref, Reason}, #data{monitor={_, Ref}} = Data) ->
+    blown_close(Reason, Data);
+blown_norecv(info, {cs_client_fuse, ok}, Data) ->
+    {next_state, norecv, Data};
+blown_norecv(info, {cs_client_fuse, blown}, _) ->
+    keep_state_and_data;
+blown_norecv(info, {'DOWN', MRef, _, _, _}, #data{monitor={MRef, _}} = Data) ->
+    blown_close(shutdown, Data);
+blown_norecv(Type, Event, Data) ->
+    handle_event(Type, Event, blown_norecv, Data).
+
+blown(info, {cs_client_fuse, ok}, undefined) ->
+    {next_state, closed, undefined, {next_event, internal, connect}};
+blown(info, {cs_client_fuse, blown}, undefined) ->
+    keep_state_and_data;
+blown(Type, Event, Data) ->
+    handle_event(Type, Event, blown, Data).
 
 code_change(_, State, Data, _) ->
     {ok, State, Data}.
@@ -125,6 +177,8 @@ handle_event(info, {'DOWN', MRef, _, _, _}, _,
 handle_event(cast, {done, _}, _, _) ->
     keep_state_and_data;
 handle_event(cast, {close, _, _}, _, _) ->
+    keep_state_and_data;
+handle_event(info, {cs_client_fuse, ok}, _, _) ->
     keep_state_and_data.
 
 connect(Addr, Port) ->
@@ -143,11 +197,25 @@ connect(Addr, Port) ->
 backoff(Reason) ->
     error_logger:error_msg("cliserv ~p ~p backing off: ~ts~n",
                            [?MODULE, self(), cs_client:format_error(Reason)]),
+    melt(Reason),
     backoff().
 
 backoff() ->
     Backoff = ?BACKOFF div 2 + rand:uniform(?BACKOFF),
     {keep_state, erlang:start_timer(Backoff, self(), connect)}.
+
+cancel_backoff(TRef) ->
+    case erlang:cancel_timer(TRef) of
+        false -> flush_backoff(TRef);
+        _     -> ok
+    end.
+
+flush_backoff(TRef) ->
+    receive
+        {timeout, TRef, _} -> ok
+    after
+        0 -> error(badtimer, [TRef])
+    end.
 
 passive_ask(#data{monitor={MRef, _}, sock=Sock, counter=Counter} = Data) ->
     demonitor(MRef, [flush]),
@@ -249,6 +317,7 @@ close(Reason, #data{monitor={MRef, _}, sock=Sock} = Data) ->
     gen_tcp:close(Sock),
     flush(Data),
     demonitor(MRef, [flush]),
+    melt(Reason),
     {next_state, closed, undefined, {next_event, internal, connect}}.
 
 report_close(shutdown) ->
@@ -256,6 +325,45 @@ report_close(shutdown) ->
 report_close(Reason) ->
     error_logger:error_msg("~p ~p closing socket: ~ts~n",
                            [?MODULE, self(), cs_client:format_error(Reason)]).
+
+melt(shutdown) ->
+    ok;
+melt(Reason) ->
+    cs_client_fuse:melt(Reason).
+
+blown_cancel(#data{monitor={MRef, Pid}} = Data) ->
+    case cs_client:cancel(Pid, MRef) of
+        1     -> blown_close(shutdown, Data);
+        false -> blown_await(Data)
+    end.
+
+blown_await(#data{monitor={MRef, _}} = Data) ->
+    case sbroker:await(MRef, 0) of
+        {go, Ref, {call, Pid}, _, _} -> blown_call(Ref, Pid, Data);
+        {go, Ref, {cast, Pid}, _, _} -> blown_cast(Ref, Pid, Data);
+        {drop, _}                    -> blown_close(shutdown, Data)
+    end.
+
+blown_call(Ref, Pid, Data) ->
+    case pacify(Data) of
+        recv ->
+            {next_state, recv, NData} = passive_recv(Ref, Pid, Data),
+            {next_state, blown_recv, NData};
+        {Next, Bin} when is_function(Next, 1) ->
+            active_decode(Ref, Pid, Bin, Data),
+            blown_close(shutdown, Data);
+        {error, Reason} ->
+            client_error(Pid, Ref, Reason),
+            blown_close(Reason, Data)
+    end.
+
+blown_cast(Ref, Pid, Data) ->
+    {next_state, norecv, NData} = active_norecv(Ref, Pid, Data),
+    {next_state, blown_norecv, NData}.
+
+blown_close(Reason, Data) ->
+    _ = close(Reason, Data),
+    {next_state, blown, undefined}.
 
 call_await(Ref, Pid, Id, Sock, Timeout) ->
     MRef = monitor(process, Pid),

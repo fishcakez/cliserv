@@ -31,7 +31,8 @@ init([]) ->
     Port = application:get_env(cliserv, port, 9876),
     IfAddr = application:get_env(cliserv, ifaddr, loopback),
     Opts = [{ifaddr, IfAddr}, {reuseaddr, true}, {packet, 4}, {active, 4},
-            {mode, binary}, {send_timeout, 5000}, {send_timeout_close, true}],
+            {mode, binary}, {send_timeout, 5000}, {send_timeout_close, true},
+            {exit_on_close, false}],
     case gen_tcp:listen(Port, Opts) of
         {ok, Sock} ->
             MRef = monitor(port, Sock),

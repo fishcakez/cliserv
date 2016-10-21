@@ -10,6 +10,7 @@
 %% application api
 
 start(_StartType, _StartArgs) ->
+    ok = cs_client_fuse:install(),
     cliserv_sup:start_link().
 
 stop(_State) ->
