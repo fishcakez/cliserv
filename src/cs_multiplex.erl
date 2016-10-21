@@ -374,6 +374,7 @@ timeout(Ref, State, Data) ->
             Reason = {inet, timeout},
             client_error(Pid, Ref, Reason),
             demonitor(MRef, [flush]),
+            melt(Reason),
             ignore(Id, State, Data);
         error ->
             keep_state_and_data
