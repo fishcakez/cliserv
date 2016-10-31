@@ -106,6 +106,10 @@ await(Type, Event, Data) ->
 
 recv(cast, {done, MRef}, #data{monitor={MRef, _}, counter=Counter} = Data) ->
     passive_ask(Data#data{counter=Counter+1});
+recv(cast, {exception, MRef},
+     #data{monitor={MRef, _}, counter=Counter} = Data) ->
+    cs_client_fuse:service_melt(),
+    passive_ask(Data#data{counter=Counter+1});
 recv(cast, {close, MRef, Reason}, #data{monitor={MRef, _}} = Data) ->
     close(Reason, Data);
 recv(info, {cs_client_fuse, blown}, Data) ->
@@ -114,6 +118,9 @@ recv(Type, Event, Data) ->
     handle_event(Type, Event, recv, Data).
 
 blown_recv(cast, {done, MRef}, #data{monitor={MRef, _}} = Data) ->
+    blown_close(shutdown, Data);
+blown_recv(cast, {exception, MRef}, #data{monitor={MRef, _}} = Data) ->
+    cs_client_fuse:service_melt(),
     blown_close(shutdown, Data);
 blown_recv(cast, {close, MRef, Reason}, #data{monitor={MRef, _}} = Data) ->
     blown_close(Reason, Data);
@@ -176,6 +183,8 @@ handle_event(info, {'DOWN', MRef, _, _, _}, _,
     close(shutdown, Data);
 handle_event(cast, {done, _}, _, _) ->
     keep_state_and_data;
+handle_event(cast, {exception, _}, _, _) ->
+    keep_state_and_data;
 handle_event(cast, {close, _, _}, _, _) ->
     keep_state_and_data;
 handle_event(info, {cs_client_fuse, ok}, _, _) ->
@@ -197,7 +206,7 @@ connect(Addr, Port) ->
 backoff(Reason) ->
     error_logger:error_msg("cliserv ~p ~p backing off: ~ts~n",
                            [?MODULE, self(), cs_client:format_error(Reason)]),
-    melt(Reason),
+    transport_melt(Reason),
     backoff().
 
 backoff() ->
@@ -241,16 +250,31 @@ active_recv(Ref, Pid, Data) when is_reference(Ref) ->
         recv ->
             passive_recv(Ref, Pid, Data);
         {Next, Bin} when is_function(Next, 1) ->
-            active_decode(Ref, Pid, Bin, Data),
-            Next(Data);
+            Close = fun(Reason, NData) -> close(Reason, NData) end,
+            active_decode(Ref, Pid, Bin, Next, Close, Data);
         {error, Reason} ->
             client_error(Pid, Ref, Reason),
             close(Reason, Data)
     end.
 
-active_decode(Ref, Pid, Bin, #data{counter=Counter}) ->
-    {reply, Counter, BinResp} = cs_packet:decode(Bin),
-    client_reply(Pid, Ref, BinResp).
+active_decode(Ref, Pid, Bin, Next, Close, #data{counter=Counter} = Data) ->
+    case cs_packet:decode(Bin) of
+        {reply, Counter, BinResp} ->
+            client_reply(Pid, Ref, BinResp),
+            Next(Data);
+        {exception, Counter, BinError} ->
+            client_exception(Pid, Ref, BinError),
+            cs_client_fuse:service_melt(),
+            Next(Data);
+        {error, Reason} ->
+            NReason = {packet, Reason},
+            client_error(Pid, Ref, NReason),
+            Close(NReason, Data);
+        Packet ->
+            Reason = {packet, Packet},
+            client_error(Pid, Ref, Reason),
+            Close(Reason, Data)
+    end.
 
 pacify(#data{sock=Sock} = Data) ->
     case inet:setopts(Sock, [{active, false}]) of
@@ -317,7 +341,7 @@ close(Reason, #data{monitor={MRef, _}, sock=Sock} = Data) ->
     gen_tcp:close(Sock),
     flush(Data),
     demonitor(MRef, [flush]),
-    melt(Reason),
+    transport_melt(Reason),
     {next_state, closed, undefined, {next_event, internal, connect}}.
 
 report_close(shutdown) ->
@@ -326,10 +350,10 @@ report_close(Reason) ->
     error_logger:error_msg("~p ~p closing socket: ~ts~n",
                            [?MODULE, self(), cs_client:format_error(Reason)]).
 
-melt(shutdown) ->
+transport_melt(shutdown) ->
     ok;
-melt(Reason) ->
-    cs_client_fuse:melt(Reason).
+transport_melt(_) ->
+    cs_client_fuse:transport_melt().
 
 blown_cancel(#data{monitor={MRef, Pid}} = Data) ->
     case cs_client:cancel(Pid, MRef) of
@@ -350,8 +374,9 @@ blown_call(Ref, Pid, Data) ->
             {next_state, recv, NData} = passive_recv(Ref, Pid, Data),
             {next_state, blown_recv, NData};
         {Next, Bin} when is_function(Next, 1) ->
-            active_decode(Ref, Pid, Bin, Data),
-            blown_close(shutdown, Data);
+            Blown = fun(NData) -> blown_close(shutdown, NData) end,
+            Close = fun(Reason, NData) -> blown_close(Reason, NData) end,
+            active_decode(Ref, Pid, Bin, Blown, Close, Data);
         {error, Reason} ->
             client_error(Pid, Ref, Reason),
             blown_close(Reason, Data)
@@ -386,6 +411,9 @@ call_recv(Ref, Pid, Id, {ok, Data}) ->
         {reply, Id, BinResp} ->
             done(Pid, Ref),
             {ok, BinResp};
+        {exception, Id, BinError} ->
+            exception(Pid, Ref),
+            {exception, BinError};
         {error, Reason} ->
             NReason = {packet, Reason},
             close(Pid, Ref, NReason),
@@ -409,7 +437,10 @@ call_error(Ref, Pid, Reason) ->
             {error, Reason};
         {reply, Ref, BinResp} ->
             demonitor(MRef, [flush]),
-            {ok, binary_to_term(BinResp)};
+            {ok, BinResp};
+        {exception, Ref, BinError} ->
+            demonitor(MRef, [flush]),
+            {exception, BinError};
         {error, Ref, NReason} ->
             demonitor(MRef, [flush]),
             {error, NReason};
@@ -419,6 +450,9 @@ call_error(Ref, Pid, Reason) ->
 
 done(Pid, Ref) ->
     gen_statem:cast(Pid, {done, Ref}).
+
+exception(Pid, Ref) ->
+    gen_statem:cast(Pid, {exception, Ref}).
 
 close(Pid, Ref, Reason) ->
     gen_statem:cast(Pid, {close, Ref, Reason}).
@@ -434,4 +468,8 @@ client_error(Pid, Ref, Reason) ->
 
 client_reply(Pid, Ref, Resp) ->
     _ = Pid ! {reply, Ref, Resp},
+    ok.
+
+client_exception(Pid, Ref, Error) ->
+    _ = Pid ! {exception, Ref, Error},
     ok.

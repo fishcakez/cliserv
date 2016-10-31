@@ -6,7 +6,8 @@
 
 -export([install/0]).
 -export([ask/0]).
--export([melt/1]).
+-export([transport_melt/0]).
+-export([service_melt/0]).
 
 %% gen_event api
 
@@ -19,39 +20,38 @@
 
 %% types
 
--define(INET, cs_client_inet).
--define(PACKET, cs_client_packet).
+-define(TRANSPORT, cs_client_transport).
+-define(SERVICE, cs_client_service).
 
 %% public api
 
 install() ->
-    case ensure(?INET, client_inet_fuse) of
-        ok                 -> ensure(?PACKET, client_packet_fuse);
+    case ensure(?TRANSPORT, client_transport_fuse) of
+        ok                 -> ensure(?SERVICE, client_service_fuse);
         {error, _} = Error -> Error
     end.
 
 ask() ->
-    case fuse:ask(?INET, sync) of
-        ok    -> fuse:ask(?PACKET, sync);
+    case fuse:ask(?TRANSPORT, sync) of
+        ok    -> fuse:ask(?SERVICE, sync);
         blown -> blown
     end.
 
-melt({inet, _}) ->
-    fuse:melt(?INET);
-melt({packet, _}) ->
-    fuse:melt(?PACKET);
-melt({drop, _}) ->
-    ok.
+transport_melt() ->
+    fuse:melt(?TRANSPORT).
+
+service_melt() ->
+    fuse:melt(?SERVICE).
 
 %% gen_event api
 
 init(_) ->
-    update(fuse:ask(?INET, sync), fuse:ask(?PACKET, sync)).
+    update(fuse:ask(?TRANSPORT, sync), fuse:ask(?SERVICE, sync)).
 
-handle_event({?INET, Inet}, {_, Packet}) ->
-    update(Inet, Packet);
-handle_event({?PACKET, Packet}, {Inet, _}) ->
-    update(Inet, Packet);
+handle_event({?TRANSPORT, Transport}, {_, Service}) ->
+    update(Transport, Service);
+handle_event({?SERVICE, Service}, {Transport, _}) ->
+    update(Transport, Service);
 handle_event(_, State) ->
     {ok, State}.
 
@@ -81,9 +81,9 @@ fuse(Key) ->
 update(ok, ok) ->
     update(ok),
     {ok, {ok, ok}};
-update(Inet, Packet) ->
+update(Transport, Service) ->
     update(blown),
-    {ok, {Inet, Packet}}.
+    {ok, {Transport, Service}}.
 
 update(Status) ->
     _ = [Pid ! {?MODULE, Status} ||

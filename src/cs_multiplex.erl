@@ -246,7 +246,7 @@ async_ask_r(Sock, Id) ->
 backoff(Reason) ->
     error_logger:error_msg("cliserv ~p ~p backing off: ~ts~n",
                            [?MODULE, self(), cs_client:format_error(Reason)]),
-    melt(Reason),
+    transport_melt(Reason),
     backoff().
 
 backoff() ->
@@ -284,46 +284,67 @@ go_cast(Ref, Pid, #data{broker={BrokerMRef, _}, clients=Clients,
     {next_state, send, NData}.
 
 await_decode(Bin, Data) ->
-    {keep_state, decode(Bin, Data)}.
+    case decode(Bin, Data) of
+        {ok, NData}            -> {keep_state, NData};
+        {error, Reason, NData} -> close(Reason, await, NData)
+    end.
 
 send_decode(Bin, Data) ->
     case decode(Bin, Data) of
-        #data{sender=undefined, sock=Sock, counter=Counter} = NData ->
+        {ok, #data{sender=undefined, sock=Sock, counter=Counter} = NData} ->
             {await, MRef, Pid} = async_ask_r(Sock, Counter),
             {next_state, await, NData#data{broker={MRef, Pid}}};
-        NData ->
-            {keep_state, NData}
+        {ok, NData} ->
+            {keep_state, NData};
+        {error, Reason, NData} ->
+            close(Reason, send, NData)
     end.
 
 recv_decode(Bin, #data{clients=Clients} = Data)
   when map_size(Clients) == ?SIZE ->
-    #data{sock=Sock, counter=Counter} = NData = decode(Bin, Data),
-    {await, MRef, Pid} = async_ask_r(Sock, Counter),
-    {next_state, await, NData#data{broker={MRef, Pid}}}.
+    case decode(Bin, Data) of
+        {ok, #data{sock=Sock, counter=Counter} = NData} ->
+            {await, MRef, Pid} = async_ask_r(Sock, Counter),
+            {next_state, await, NData#data{broker={MRef, Pid}}};
+        {error, Reason, NData} ->
+            close(Reason, recv, NData)
+    end.
 
 shutdown_decode(Bin, State, Data) ->
     case decode(Bin, Data) of
-        #data{clients=Clients, ignores=Ignores} = NData
+        {ok, #data{clients=Clients, ignores=Ignores} = NData}
           when map_size(Clients) == Ignores ->
             close(shutdown, State, NData);
-        NData ->
-            {keep_state, NData}
+        {ok, NData} ->
+            {keep_state, NData};
+        {error, Reason, NData} ->
+            close(Reason, State, NData)
     end.
 
-decode(Bin, #data{clients=Clients, ignores=Ignores, sender=Sender} = Data) ->
-    {reply, Id, BinResp} = cs_packet:decode(Bin),
+decode(Bin, Data) ->
+    packet(cs_packet:decode(Bin), Data).
+
+packet({Tag, Id, BinResp} = Packet,
+       #data{clients=Clients, ignores=Ignores, sender=Sender} = Data)
+  when Tag == reply; Tag == exception ->
     case maps:take(Id, Clients) of
         {{Sender, Pid, MRef}, NClients} when is_pid(Pid) ->
-            client_reply(Pid, Sender, BinResp),
+            client_result(Pid, Sender, Tag, BinResp),
             demonitor(MRef, [flush]),
-            Data#data{clients=NClients, sender=undefined};
+            {ok, Data#data{clients=NClients, sender=undefined}};
         {{Ref, Pid, MRef}, NClients} when is_pid(Pid) ->
-            client_reply(Pid, Ref, BinResp),
+            client_result(Pid, Ref, Tag, BinResp),
             demonitor(MRef, [flush]),
-            Data#data{clients=NClients};
+            {ok, Data#data{clients=NClients}};
         {ignore, NClients} ->
-            Data#data{clients=NClients, ignores=Ignores-1}
-    end.
+            {ok, Data#data{clients=NClients, ignores=Ignores-1}};
+        error ->
+            {error, {packet, Packet}, Data}
+    end;
+packet({error, Reason}, Data) ->
+    {error, {packet, Reason}, Data};
+packet(Packet, Data) ->
+    {error, {packet, Packet}, Data}.
 
 send_sent(#data{clients=Clients, sock=Sock, counter=Counter} = Data)
   when map_size(Clients) < ?SIZE ->
@@ -374,7 +395,7 @@ timeout(Ref, State, Data) ->
             Reason = {inet, timeout},
             client_error(Pid, Ref, Reason),
             demonitor(MRef, [flush]),
-            melt(Reason),
+            transport_melt(Reason),
             ignore(Id, State, Data);
         error ->
             keep_state_and_data
@@ -457,7 +478,7 @@ close(Reason, #data{clients=Clients, broker=undefined, sock=Sock} = Data) ->
          demonitor(MRef, [flush])],
     gen_tcp:close(Sock),
     flush(Data),
-    melt(Reason),
+    transport_melt(Reason),
     {next_state, closed, undefined, {next_event, internal, connect}}.
 
 report_close(shutdown) ->
@@ -466,10 +487,10 @@ report_close(Reason) ->
     error_logger:error_msg("~p ~p closing socket: ~ts~n",
                            [?MODULE, self(), cs_client:format_error(Reason)]).
 
-melt(shutdown) ->
+transport_melt(shutdown) ->
     ok;
-melt(Reason) ->
-    cs_client_fuse:melt(Reason).
+transport_melt(_) ->
+    cs_client_fuse:transport_melt().
 
 flush(#data{sock=Sock} = Data) ->
     receive
@@ -534,6 +555,9 @@ call_await(Ref, Pid, MRef, Timeout) ->
         {reply, Ref, BinReq} ->
             demonitor(MRef, [flush]),
             {ok, BinReq};
+        {exception, Ref, BinError} ->
+            demonitor(MRef, [flush]),
+            {exception, BinError};
         {error, Ref, Reason} ->
             demonitor(MRef, [flush]),
             {error, Reason};
@@ -545,9 +569,12 @@ call_await(Ref, Pid, MRef, Timeout) ->
             call_await(Ref, Pid, MRef, infinity)
     end.
 
-client_reply(Pid, Ref, BinReq) ->
-    _ = Pid ! {reply, Ref, BinReq},
-    ok.
+client_result(Pid, Ref, reply, BinResp) ->
+    _ = Pid ! {reply, Ref, BinResp},
+    ok;
+client_result(Pid, Ref, exception, BinError) ->
+    _ = Pid ! {exception, Ref, BinError},
+    cs_client_fuse:service_melt().
 
 client_error(Pid, Ref, Reason) ->
     _ = Pid ! {error, Ref, Reason},

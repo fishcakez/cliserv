@@ -17,11 +17,20 @@ init(_) ->
     {ok, undefined}.
 
 handle_call({M, F, A}, _, State) ->
-    {reply, apply(M, F, A), State}.
+    try apply(M, F, A) of
+        Result ->
+            {reply, Result, State}
+    catch
+        throw:Reason ->
+            {exception, {throw, Reason, erlang:get_stacktrace()}, State}
+    end.
 
 handle_cast({M, F, A}, State) ->
-    apply(M, F, A),
-    {noreply, State}.
+    try apply(M, F, A) of
+        _       -> {noreply, State}
+    catch
+        throw:_ -> {noreply, State}
+    end.
 
 handle_info(Msg, State) ->
     error_logger:error_msg("cs_handler ~p received unexpected message: ~p",

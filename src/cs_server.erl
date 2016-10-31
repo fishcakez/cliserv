@@ -22,11 +22,13 @@
       Arg :: term(),
       State :: term().
 
--callback handle_call(Req, From, State) -> {reply, Resp, NState} when
+-callback handle_call(Req, From, State) ->
+    {reply, Resp, NState} | {exception, Error, NState} when
       Req :: term(),
       From :: {pid(), term()},
       State :: term(),
       Resp :: term(),
+      Error :: {error | exit | throw, term(), list()},
       NState :: term().
 
 -callback handle_cast(Req, State) -> {noreply, NState} when
@@ -77,6 +79,7 @@ acceptor_init(SockName, Sock, {Mod, Args, Opts}) ->
     end.
 
 acceptor_continue(PeerName, Sock, #{mod := Mod, args := Args} = Info) ->
+    _ = put('$initial_call', {Mod, init, 1}),
     try Mod:init(Args) of
         Result -> init(Result, PeerName, Sock, Info)
     catch
@@ -118,16 +121,20 @@ handle_event(info, {'DOWN', RegMon, _, _, Reason}, _,
              #data{reg_monitor=RegMon}) ->
     {stop, {shutdown, Reason}};
 handle_event({call, From}, Req, State, Data) ->
-    {reply, Resp, NState} = handle(handle_call, Req, From, State, Data),
-    {next_state, NState, Data, reply_event(From, Resp, Data)};
+    case handle(handle_call, Req, From, State, Data) of
+        {reply, Resp, NState} ->
+            {next_state, NState, Data, reply_event(From, Resp, Data)};
+        {exception, Error, NState} ->
+            {next_state, NState, Data, exception_event(From, Error, Data)}
+    end;
 handle_event(cast, Req, State, Data) ->
     {noreply, NState} = handle(handle_cast, Req, State, Data),
     {next_state, NState, Data};
 handle_event(info, Req, State, Data) ->
     {noreply, NState} = handle(handle_info, Req, State, Data),
     {next_state, NState, Data};
-handle_event(internal, {reply, Id, Resp}, _, #data{sock=Sock}) ->
-    IOData = cs_packet:encode(reply, Id, term_to_binary(Resp)),
+handle_event(internal, {Tag, Id, Resp}, _, #data{sock=Sock}) ->
+    IOData = cs_packet:encode(Tag, Id, term_to_binary(Resp)),
     case gen_tcp:send(Sock, IOData) of
         ok               -> keep_state_and_data;
         {error, closed}  -> {stop, {shutdown, tcp_closed}};
@@ -176,3 +183,6 @@ reply_event({_, {CallRef, Id}}, Resp, #data{call_ref=CallRef}) ->
     {next_event, internal, {reply, Id, Resp}};
 reply_event(From, Resp, _) ->
     {reply, From, Resp}.
+
+exception_event({_, {CallRef, Id}}, Exception, #data{call_ref=CallRef}) ->
+    {next_event, internal, {exception, Id, Exception}}.
